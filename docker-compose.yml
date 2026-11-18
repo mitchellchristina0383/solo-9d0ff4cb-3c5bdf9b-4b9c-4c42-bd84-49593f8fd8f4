@@ -39,6 +39,9 @@ services:
       WRITER_READ_TIMEOUT: "30"
       CONNECT_TIMEOUT: "3"
       PROBE_TIMEOUT: "2.5"
+      # 正文清除：后台对账循环间隔与单次清除请求超时（待清除单按此节奏重试）。
+      PURGE_POLL_INTERVAL: "2.5"
+      PURGE_REQUEST_TIMEOUT: "5"
     volumes:
       - proxy-data:/data
     depends_on:

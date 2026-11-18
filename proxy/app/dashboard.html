@@ -50,6 +50,11 @@
   .kv b { color:var(--mut); font-weight:600; }
   .uncertain-note { border-left:3px solid var(--warn); padding:8px 12px; background:rgba(241,185,68,.08);
                     border-radius:0 8px 8px 0; font-size:12.5px; }
+  .purge-note { border-left:3px solid var(--info); padding:8px 12px; background:rgba(74,163,255,.08);
+                    border-radius:0 8px 8px 0; font-size:12.5px; }
+  .b-purge { background:rgba(74,163,255,.18); color:var(--info); }
+  .b-done { background:rgba(46,204,113,.18); color:var(--ok); }
+  .masked { color:var(--mut); font-style:italic; }
 </style>
 </head>
 <body>
@@ -78,15 +83,41 @@
   </section>
 
   <section class="card">
+    <h2>按写入 ID 发起单笔正文清除（保留 ID、节点归属与回执；受理即遮蔽，原节点持久清除后才完成）</h2>
+    <div class="row">
+      <input type="text" id="purgeId" placeholder="粘贴或输入写入 ID（完整 UUID）">
+      <button class="danger" id="purgeBtn">清除该笔正文</button>
+      <span class="muted">也可直接点下方记录行里的"清除正文"。节点失联会保持"待清除"，后台自动接续。</span>
+    </div>
+    <p class="purge-note" style="margin-top:12px">
+      🔒 清除受理后：状态页、节点记录页、核实接口<b>立即遮蔽正文</b>（显示
+      <code>***PURGED***</code>）；代理只向<b>原送达节点</b>发持久清除，
+      只有该节点也清除成功才标记 <b>PURGE_DONE</b>。代理重启、重复点击、与慢回执交错都不会恢复正文。
+    </p>
+  </section>
+
+  <section class="card">
     <h2>代理侧写入记录（含排空视角：非现役节点上未回执的写入）</h2>
     <div style="overflow:auto"><table id="writes">
-      <thead><tr><th>写入 ID</th><th>送达节点</th><th>状态</th><th>说明</th><th>时间</th><th></th></tr></thead>
+      <thead><tr><th>写入 ID</th><th>送达节点</th><th>正文</th><th>状态</th><th>清除状态</th><th>说明</th><th>时间</th><th></th></tr></thead>
       <tbody></tbody>
     </table></div>
     <p class="uncertain-note" style="margin-top:12px">
       ⚠️ <b>TIMEOUT_UNCERTAIN</b>：写入已在后端落库但回执超时，结果不确定。
       系统<b>不会</b>自动向另一节点补投；可点"向原节点查询"核实（切流后仍查原送达节点）。
     </p>
+  </section>
+
+  <section class="card">
+    <h2>清除单（排空核对：待清除由后台对账循环持续重试，已完成表示原节点也已持久清除）</h2>
+    <div class="row" style="margin-bottom:8px">
+      <span class="badge b-purge">待清除 <b id="purgePending">0</b></span>
+      <span class="badge b-done">已完成 <b id="purgeDone">0</b></span>
+    </div>
+    <div style="overflow:auto"><table>
+      <thead><tr><th>写入 ID</th><th>原节点</th><th>清除状态</th><th>尝试次数</th><th>最近错误/说明</th><th>更新时间</th></tr></thead>
+      <tbody id="purges"></tbody>
+    </table></div>
   </section>
 
   <section class="card">
@@ -123,6 +154,18 @@ function statusBadge(s){
   const [cls,label] = map[s] || ['b-mut',s];
   return `<span class="badge ${cls}">${label}</span>`;
 }
+function purgeBadge(p){
+  if(!p) return '<span class="badge b-mut">未清除</span>';
+  if(p.purge_state === 'PURGE_DONE')
+    return '<span class="badge b-done">已完成 PURGE_DONE</span>';
+  return '<span class="badge b-purge">待清除 PURGE_PENDING</span>';
+}
+function payloadCell(w){
+  if(w.payload_purged || w.payload === '***PURGED***')
+    return '<span class="masked mono">***PURGED***</span>';
+  const txt = esc(String(w.payload||''));
+  return `<span class="mono" title="${txt}">${txt.length>34?txt.slice(0,34)+'…':txt}</span>`;
+}
 async function api(path, opts={}){
   const r = await fetch(path, {headers:{'Content-Type':'application/json'}, ...opts});
   const data = await r.json().catch(()=>({}));
@@ -153,6 +196,19 @@ async function refreshOne(id){
     await refresh();
   }catch(e){ toast('查询失败：'+e.message, false); }
 }
+async function purgeOne(id){
+  if(!id){ toast('请输入写入 ID', false); return; }
+  try{
+    const r = await api(`/api/writes/${encodeURIComponent(id)}/purge`, {method:'POST'});
+    if(r.purge_state === 'PURGE_DONE')
+      toast(`清除完成：原节点 ${r.node} 已持久清除，正文已遮蔽`);
+    else
+      toast(`已受理并遮蔽正文，原节点暂不可达/未完成，保持待清除，后台自动接续（第 ${r.attempts} 次）`, false);
+    await refresh();
+  }catch(e){ toast('清除失败：'+e.message, false); }
+}
+$('#purgeBtn').onclick = () => purgeOne($('#purgeId').value.trim());
+$('#purgeId').addEventListener('keydown', e => { if(e.key==='Enter') purgeOne(e.target.value.trim()); });
 
 $('#send').onclick = async () => {
   const btn = $('#send'); btn.disabled = true; btn.textContent = '投递中…';
@@ -200,14 +256,35 @@ async function refresh(){
     </div>`;
   }).join('');
 
+  const purgeMap = {};
+  (s.purges.pending||[]).forEach(p => purgeMap[p.write_id] = p);
+  (s.purges.recent_done||[]).forEach(p => purgeMap[p.write_id] = p);
+  $('#purgePending').textContent = s.purges.pending_count;
+  $('#purgeDone').textContent = s.purges.done_count;
+
   $('#writes tbody').innerHTML = s.writes.map(w => `<tr>
-    <td class="mono">${esc(w.id.slice(0,8))}…</td>
+    <td class="mono">${esc(w.id.slice(0,8))}…<div class="muted" style="font-size:11px">${esc(w.id)}</div></td>
     <td><span class="badge ${w.target_node===s.active?'b-info':'b-mut'}">${esc(w.target_node)}</span></td>
+    <td>${payloadCell(w)}</td>
     <td>${statusBadge(w.status)}</td>
-    <td class="muted" style="max-width:380px">${esc(w.status_detail)}</td>
+    <td>${purgeBadge(purgeMap[w.id])}</td>
+    <td class="muted" style="max-width:300px">${esc(w.status_detail)}</td>
     <td class="muted">${fmt(w.created_at)}</td>
-    <td><button onclick="refreshOne('${esc(w.id)}')">向原节点查询</button></td>
-  </tr>`).join('') || '<tr><td colspan="6" class="muted">暂无写入</td></tr>';
+    <td style="white-space:nowrap">
+      <button onclick="refreshOne('${esc(w.id)}')">向原节点查询</button>
+      <button class="danger" onclick="purgeOne('${esc(w.id)}')">清除正文</button>
+    </td>
+  </tr>`).join('') || '<tr><td colspan="8" class="muted">暂无写入</td></tr>';
+
+  const allPurges = (s.purges.pending||[]).concat(s.purges.recent_done||[]);
+  $('#purges').innerHTML = allPurges.map(p => `<tr>
+    <td class="mono">${esc(p.write_id.slice(0,8))}…<div class="muted" style="font-size:11px">${esc(p.write_id)}</div></td>
+    <td><span class="badge b-mut">${esc(p.target_node)}</span></td>
+    <td>${purgeBadge(p)}</td>
+    <td>${p.attempts}</td>
+    <td class="muted" style="max-width:360px">${esc(p.last_error||('原节点已持久清除' ))}</td>
+    <td class="muted">${fmt(p.updated_at)}</td>
+  </tr>`).join('') || '<tr><td colspan="6" class="muted">暂无清除单</td></tr>';
 
   $('#events').innerHTML = s.events.map(ev => `<tr>
     <td class="muted">${fmt(ev.ts)}</td><td><span class="badge b-mut">${esc(ev.kind)}</span></td>
